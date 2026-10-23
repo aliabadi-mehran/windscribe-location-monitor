@@ -1,0 +1,16 @@
+[project]
+name = "windscribe-monitor"
+version = "0.1.0"
+description = "Safe cross-platform Windscribe location monitor for macOS and Linux ARM64"
+requires-python = ">=3.9"
+
+[project.scripts]
+windscribe-monitor = "windscribe_monitor.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["windscribe_monitor"]
+

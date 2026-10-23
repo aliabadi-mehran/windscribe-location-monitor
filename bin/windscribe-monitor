@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
+if command -v caffeinate >/dev/null 2>&1; then
+  exec caffeinate -i "$PYTHON_BIN" -m windscribe_monitor.cli "$@"
+fi
+exec "$PYTHON_BIN" -m windscribe_monitor.cli "$@"
+

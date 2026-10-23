@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Windscribe location monitoring every six hours
+
+[Timer]
+OnCalendar=*-*-* 03,09,15,21:00:00
+Persistent=true
+AccuracySec=1min
+Unit=windscribe-monitor.service
+
+[Install]
+WantedBy=timers.target
+

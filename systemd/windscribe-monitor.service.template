@@ -1,0 +1,13 @@
+[Unit]
+Description=Windscribe location monitoring sweep
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=__PROJECT__
+ExecStart=__PYTHON__ -m windscribe_monitor.cli --home __HOME__ run-scheduled
+TimeoutStartSec=5h45min
+Nice=10
+IOSchedulingClass=idle
+

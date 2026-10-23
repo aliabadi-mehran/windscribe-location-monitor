@@ -1,0 +1,5 @@
+# One official Windscribe datacenter nickname per line.
+# Optional supported-manual-config hostname after a pipe enables separate UDP diagnostics later.
+# Example only (do not assume availability):
+# Example Nickname | example.windscribe.com
+

@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+state/
+*.log
+config.json
+*.token
+secrets/
+.venv/
+
+
