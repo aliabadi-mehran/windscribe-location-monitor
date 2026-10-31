@@ -125,7 +125,7 @@ After reviewing the JSON evidence under `~/Library/Application Support/Windscrib
 ./bin/windscribe-monitor run
 ```
 
-No unmeasured number is substituted. Missing ping or speed values appear as `نامشخص` in Telegram.
+No unmeasured number is substituted. Missing ping or speed values appear as `N/A` in Telegram.
 
 ## Scheduling
 
