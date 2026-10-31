@@ -17,6 +17,8 @@ from .locations import import_rename_export, load_locations
 from .runner import Monitor
 from .telegram import Telegram, flush_queue, queue_message
 from .windscribe import Windscribe
+from .wireguard import (WireGuardMonitor, discover_wireguard_configs,
+                        validate_profile_permissions)
 
 
 def setup_logging(home: Path, verbose: bool = False) -> None:
@@ -57,19 +59,55 @@ def store_telegram_token(config: Config, home: Path) -> None:
 def cmd_doctor(config: Config, home: Path) -> int:
     data = {
         "python": sys.version.split()[0],
-        "windscribe_cli": config.windscribe_cli,
-        "windscribe_cli_exists": bool(shutil.which(config.windscribe_cli) or Path(config.windscribe_cli).exists()),
         "home": str(home),
-        "locations": len(load_locations(home / "locations.txt")),
-        "telegram_token_in_keychain": bool(Telegram(config).token()),
+        "telegram_token_configured": bool(Telegram(config).token()),
         "telegram_chat_configured": bool(config.telegram_chat_id),
     }
-    try:
-        data["windscribe_status"] = Windscribe(config).status().__dict__
-    except Exception as exc:
-        data["windscribe_error"] = str(exc)
+    if platform.system() == "Linux" and config.linux_backend == "wireguard-configs":
+        profiles = discover_wireguard_configs(Path(config.wireguard_config_dir))
+        helper = Path(config.wireguard_helper)
+        data.update({
+            "backend": "wireguard-configs",
+            "wireguard_config_dir": str(Path(config.wireguard_config_dir).expanduser()),
+            "wireguard_profiles": len(profiles),
+            "wireguard_profile_permission_problems": validate_profile_permissions(profiles),
+            "wireguard_helper": str(helper),
+            "wireguard_helper_installed": helper.is_file() and os.access(helper, os.X_OK),
+            "required_commands": {
+                name: bool(shutil.which(name)) for name in ("ip", "wg", "curl", "ping", "sudo")
+            },
+        })
+        if data["wireguard_helper_installed"] and data["required_commands"]["sudo"]:
+            try:
+                helper_check = subprocess.run(
+                    ["sudo", "-n", str(helper), "--help"], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=5, check=False,
+                )
+                data["wireguard_helper_sudo_ready"] = helper_check.returncode == 0
+            except subprocess.TimeoutExpired:
+                data["wireguard_helper_sudo_ready"] = False
+        else:
+            data["wireguard_helper_sudo_ready"] = False
+        healthy = (bool(profiles) and not data["wireguard_profile_permission_problems"]
+                   and data["wireguard_helper_installed"]
+                   and data["wireguard_helper_sudo_ready"]
+                   and all(data["required_commands"].values()))
+    else:
+        data.update({
+            "backend": "windscribe-cli",
+            "windscribe_cli": config.windscribe_cli,
+            "windscribe_cli_exists": bool(
+                shutil.which(config.windscribe_cli) or Path(config.windscribe_cli).exists()
+            ),
+            "locations": len(load_locations(home / "locations.txt")),
+        })
+        try:
+            data["windscribe_status"] = Windscribe(config).status().__dict__
+        except Exception as exc:
+            data["windscribe_error"] = str(exc)
+        healthy = data["windscribe_cli_exists"]
     print(json.dumps(data, indent=2, ensure_ascii=False))
-    return 0 if data["windscribe_cli_exists"] else 1
+    return 0 if healthy else 1
 
 
 def cmd_status(home: Path) -> int:
@@ -90,7 +128,12 @@ def cmd_due(config: Config, home: Path, args: argparse.Namespace) -> int:
         if time.time() - run.get("started_at", 0) < config.interval_seconds:
             print("Not due yet.")
             return 0
-    monitor = Monitor(config, home)
+    monitor = (WireGuardMonitor(config, home)
+               if platform.system() == "Linux" and config.linux_backend == "wireguard-configs"
+               else Monitor(config, home))
+    if (args.command == "run-scheduled" and isinstance(monitor, WireGuardMonitor)
+            and (home / "in-progress.json").exists()):
+        args.resume = True
     selected_locations = args.locations
     if args.command in ("run-if-due", "run-scheduled") and not selected_locations:
         selected_locations = config.scheduled_locations or None
@@ -99,7 +142,7 @@ def cmd_due(config: Config, home: Path, args: argparse.Namespace) -> int:
                           only=selected_locations, resume=args.resume)
     except Exception as exc:
         if not args.no_notify:
-            message = f"هشدار پایش Windscribe\nاجرای پایش ناموفق بود: {exc}"
+            message = f"Windscribe Monitor Alert\nThe monitoring run failed: {exc}"
             try:
                 Telegram(config).send(message)
             except Exception:
@@ -119,6 +162,10 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("flush-queue")
     commands.add_parser("telegram-test")
     commands.add_parser("telegram-discover")
+    commands.add_parser("wireguard-discover")
+    pi_config = commands.add_parser("configure-raspberry-pi")
+    pi_config.add_argument("--config-dir", type=Path, required=True)
+    pi_config.add_argument("--endpoint-port", type=int, default=80)
     bootstrap = commands.add_parser("telegram-bootstrap")
     bootstrap.add_argument("--via-location", required=True)
     flush_via = commands.add_parser("flush-via-vpn")
@@ -258,12 +305,41 @@ def main(argv: list[str] | None = None) -> int:
             print("Post one message in the private channel, then rerun with --chat-id after discovering its id.")
         return 0
     if args.command == "telegram-test":
-        Telegram(config).send("آزمایش سامانه پایش Windscribe: ارسال تلگرام با موفقیت انجام شد.")
+        Telegram(config).send("Windscribe Monitor test: Telegram delivery succeeded.")
         print("Telegram test delivered.")
         return 0
     if args.command == "telegram-discover":
         return discover_channel(config, home)
+    if args.command == "wireguard-discover":
+        profiles = discover_wireguard_configs(Path(config.wireguard_config_dir))
+        problems = validate_profile_permissions(profiles)
+        print(json.dumps({
+            "config_dir": str(Path(config.wireguard_config_dir).expanduser()),
+            "count": len(profiles),
+            "locations": [profile.name for profile in profiles],
+            "permission_problems": problems,
+        }, indent=2, ensure_ascii=False))
+        return 0 if profiles and not problems else 1
+    if args.command == "configure-raspberry-pi":
+        if platform.system() != "Linux":
+            raise RuntimeError("Raspberry Pi configuration is available only on Linux")
+        if not 1 <= args.endpoint_port <= 65535:
+            raise RuntimeError("endpoint port must be between 1 and 65535")
+        config.linux_backend = "wireguard-configs"
+        config.wireguard_config_dir = str(args.config_dir.expanduser().resolve())
+        config.wireguard_helper = "/usr/local/libexec/windscribe-monitor-netns"
+        config.wireguard_endpoint_port_override = args.endpoint_port
+        config.top_size = 5
+        config.interval_seconds = 86_400
+        path = config.save(home)
+        print(f"Updated private Raspberry Pi configuration: {path}")
+        return 0
     if args.command == "telegram-bootstrap":
+        if platform.system() == "Linux" and config.linux_backend == "wireguard-configs":
+            raise RuntimeError(
+                "telegram-bootstrap through the host VPN is disabled on Raspberry Pi; "
+                "use telegram-discover and telegram-test without changing the host route"
+            )
         monitor = Monitor(config, home)
         initial = monitor.ws.status()
         if not initial.disconnected:
@@ -285,7 +361,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("Telegram channel post was not found")
             # discover_channel persists the chat id, so reload before delivery.
             Telegram(Config.load(home)).send(
-                "آزمایش سامانه پایش Windscribe: اتصال بات و کانال با موفقیت تأیید شد."
+                "Windscribe Monitor test: the existing bot and channel were verified."
             )
             print("Telegram bootstrap test delivered.")
         finally:
@@ -296,6 +372,11 @@ def main(argv: list[str] | None = None) -> int:
         print("Windscribe stable disconnected state verified.")
         return 0
     if args.command == "flush-via-vpn":
+        if platform.system() == "Linux" and config.linux_backend == "wireguard-configs":
+            raise RuntimeError(
+                "flush-via-vpn is disabled on Raspberry Pi because it would change the host route; "
+                "the private queue will retry on the next reachable run"
+            )
         monitor = Monitor(config, home)
         initial = monitor.ws.status()
         if not initial.disconnected:

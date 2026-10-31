@@ -8,6 +8,8 @@ This is a safety stop, not a failure to clean up. The monitor will not disconnec
 
 On macOS with the GUI backend, `windscribe-cli locations` intentionally opens the location picker instead of printing names. Export the supported Rename Locations JSON and import it as described in the README. Do not scrape private APIs or guess nicknames.
 
+On Raspberry Pi, run `wireguard-discover`. An empty result means there are no authorized `.conf` files below `wireguard_config_dir`. Download/generate the missing per-location profiles through Windscribe's supported configuration workflow. The monitor cannot turn one profile into another location and will not invent endpoints or keys.
+
 ## Location does not exist or is disabled
 
 Refresh/export the Windscribe location list and re-import it. A renamed or retired datacenter may no longer match. The failure is recorded and does not stop the rest of the sweep.
@@ -32,19 +34,35 @@ Run `telegram-test` once interactively from the same macOS login session. If mac
 
 This is expected: software cannot execute while the machine is asleep. The LaunchAgent runs after login/wake. `caffeinate` only prevents idle sleep during a run that has already started. Wake scheduling requires an explicit system power-management decision. The Raspberry Pi systemd timer uses `Persistent=true` and catches up after downtime.
 
-## IKEv2 is rejected on Raspberry Pi
+## Raspberry Pi helper or permission failure
 
-This is an official platform limitation: Windscribe's CLI documentation lists IKEv2 as Windows/macOS-only. Use the official Linux ARM64 headless client with `wireguard`, `udp`, `tcp`, `stealth`, or `wstunnel`, and verify the available ports using `windscribe-cli ports <protocol>`. Do not label those results as IKEv2.
+Run `doctor`. The Pi backend requires `ip`, `wg`, `curl`, `ping`, `sudo`, mode-`600` profiles owned by the monitor user, and the reviewed root-owned helper at `/usr/local/libexec/windscribe-monitor-netns`. Re-run the helper installer only after reviewing it; it refuses to overwrite a different sudoers file.
+
+## A `wsmon-*` namespace remains
+
+Normal signal/finally cleanup removes it. First ensure no monitor process is still active. Then use the installed helper's constrained cleanup action with the exact namespace name. Do not delete host WireGuard interfaces or host routes:
+
+```sh
+sudo /usr/local/libexec/windscribe-monitor-netns cleanup --namespace wsmon-1234abcd
+```
+
+If cleanup fails, preserve `ip netns list`, the service journal, and monitor logs for diagnosis rather than changing the host network remotely.
+
+## DNS or IPv6 isolation check failed
+
+Each run records the namespace DNS servers, whether the DNS route uses the temporary WireGuard interface, whether a DNS lookup succeeded, and whether IPv4/IPv6 default routes point through the tunnel. A profile without DNS can still use host-resolved HTTPS probe addresses, but the missing DNS diagnostic remains visible. Add only DNS servers supplied by the authorized profile or explicitly configured in the private `wireguard_dns_servers` list. The namespace has no physical uplink, so a missing IPv6 tunnel default route cannot fall back to the host interface.
 
 ## A run was interrupted
 
-Signal handlers and `finally` cleanup disconnect monitor-owned tunnels. Confirm with:
+On macOS, signal handlers and `finally` cleanup disconnect monitor-owned tunnels. Confirm with:
 
 ```sh
 /usr/local/bin/windscribe-cli status
 ```
 
 If Windscribe itself is unresponsive, use the app UI; do not force-delete routes or DNS settings. The monitor never edits those directly.
+
+On Raspberry Pi, the signal handler removes only the active `wsmon-*` namespace. Scheduled runs retain `in-progress.json` and resume the same discovered-profile order after a service timeout.
 
 ## Logs and evidence
 

@@ -1,0 +1,18 @@
+{
+  "linux_backend": "wireguard-configs",
+  "wireguard_config_dir": "~/.config/windscribe/wireguard",
+  "wireguard_helper": "/usr/local/libexec/windscribe-monitor-netns",
+  "wireguard_handshake_timeout_seconds": 15,
+  "wireguard_endpoint_port_override": 80,
+  "wireguard_dns_servers": [],
+  "connect_timeout_seconds": 25,
+  "disconnect_timeout_seconds": 15,
+  "retries": 2,
+  "ping_count": 5,
+  "ping_target": "1.1.1.1",
+  "speed_test_bytes": 5000000,
+  "shortlist_size": 10,
+  "top_size": 5,
+  "interval_seconds": 86400,
+  "telegram_chat_id": ""
+}

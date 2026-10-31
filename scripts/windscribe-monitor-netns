@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Root-owned, narrowly scoped WireGuard network-namespace helper.
+
+Install a copy with install-wireguard-helper.sh.  The unprivileged monitor may
+only ask this helper to create, probe, speed-test, or remove a namespace whose
+name and interface match the wsmon naming scheme.  Private keys are never
+printed and temporary stripped configurations live only under /run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import tempfile
+import time
+import urllib.parse
+from pathlib import Path
+
+
+NS_RE = re.compile(r"wsmon-[0-9a-f]{8}$")
+IF_RE = re.compile(r"wsm[0-9a-f]{8}$")
+WG_INTERFACE_KEYS = {"privatekey", "listenport", "fwmark"}
+WG_PEER_KEYS = {"publickey", "presharedkey", "allowedips", "endpoint", "persistentkeepalive"}
+
+
+def fail(message: str) -> None:
+    raise SystemExit(message)
+
+
+def validate_names(namespace: str, interface: str | None = None) -> None:
+    if not NS_RE.fullmatch(namespace):
+        fail("invalid namespace name")
+    if interface is not None and not IF_RE.fullmatch(interface):
+        fail("invalid interface name")
+
+
+def run(args: list[str], timeout: float = 20, check: bool = True) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          timeout=timeout, check=False)
+    if check and proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+        fail(f"command failed: {Path(args[0]).name}: {detail}")
+    return proc
+
+
+def netns(namespace: str, args: list[str], timeout: float = 20,
+           check: bool = True) -> subprocess.CompletedProcess[str]:
+    return run(["ip", "netns", "exec", namespace, *args], timeout=timeout, check=check)
+
+
+def endpoint_ip(value: str, port_override: int) -> str:
+    value = value.strip()
+    if value.startswith("["):
+        host, port = value[1:].split("]:", 1)
+    else:
+        host, port = value.rsplit(":", 1)
+    if not port.isdigit():
+        fail("invalid WireGuard endpoint port")
+    if port_override:
+        if not 1 <= port_override <= 65535:
+            fail("invalid WireGuard endpoint port override")
+        port = str(port_override)
+    try:
+        ipaddress.ip_address(host)
+        resolved = host
+    except ValueError:
+        infos = socket.getaddrinfo(host, int(port), type=socket.SOCK_DGRAM)
+        if not infos:
+            fail("WireGuard endpoint DNS lookup failed")
+        resolved = infos[0][4][0]
+    return f"[{resolved}]:{port}" if ":" in resolved else f"{resolved}:{port}"
+
+
+def parse_config(path: Path, endpoint_port: int = 0) -> dict:
+    info = path.stat()
+    invoking_uid = int(os.environ.get("SUDO_UID", info.st_uid))
+    if not stat.S_ISREG(info.st_mode) or path.is_symlink():
+        fail("WireGuard config must be a regular, non-symlink file")
+    if info.st_uid != invoking_uid:
+        fail("WireGuard config must be owned by the invoking user")
+    if info.st_mode & 0o077:
+        fail("WireGuard config permissions are too open; expected mode 600")
+
+    section = ""
+    addresses: list[str] = []
+    dns: list[str] = []
+    allowed: list[str] = []
+    mtu = "1420"
+    stripped: list[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            if section not in ("interface", "peer"):
+                fail("unsupported WireGuard config section")
+            stripped.append("[Interface]" if section == "interface" else "[Peer]")
+            continue
+        if "=" not in line or section not in ("interface", "peer"):
+            fail("malformed WireGuard config")
+        key, value = (part.strip() for part in line.split("=", 1))
+        lower = key.lower()
+        if section == "interface":
+            if lower == "address":
+                addresses.extend(item.strip() for item in value.split(",") if item.strip())
+            elif lower == "dns":
+                dns.extend(item.strip() for item in value.split(",") if item.strip())
+            elif lower == "mtu":
+                if not value.isdigit() or not 576 <= int(value) <= 9000:
+                    fail("invalid MTU")
+                mtu = value
+            elif lower in WG_INTERFACE_KEYS:
+                stripped.append(f"{key} = {value}")
+        elif lower in WG_PEER_KEYS:
+            if lower == "allowedips":
+                for item in value.split(","):
+                    network = str(ipaddress.ip_network(item.strip(), strict=False))
+                    allowed.append(network)
+                value = ", ".join(allowed[-len(value.split(',')):])
+            elif lower == "endpoint":
+                value = endpoint_ip(value, endpoint_port)
+            stripped.append(f"{key} = {value}")
+    if not addresses or not allowed or not any(line.lower().startswith("privatekey") for line in stripped):
+        fail("WireGuard config is missing Address, AllowedIPs, or PrivateKey")
+    return {"addresses": addresses, "dns": dns, "allowed": allowed, "mtu": mtu,
+            "stripped": "\n".join(stripped) + "\n"}
+
+
+def cleanup(namespace: str, interface: str | None = None) -> None:
+    validate_names(namespace)
+    if interface is not None:
+        validate_names(namespace, interface)
+    run(["ip", "netns", "del", namespace], check=False)
+    # If setup failed between creating and moving the interface, remove the
+    # otherwise address-less host orphan as part of the same rollback.
+    if interface is not None:
+        run(["ip", "link", "del", interface], check=False)
+    resolv = Path("/etc/netns") / namespace / "resolv.conf"
+    try:
+        resolv.unlink(missing_ok=True)
+        resolv.parent.rmdir()
+    except OSError:
+        pass
+
+
+def setup(args: argparse.Namespace) -> None:
+    validate_names(args.namespace, args.interface)
+    if os.geteuid() != 0:
+        fail("helper must run as root")
+    config_path = Path(args.config).expanduser().resolve()
+    parsed = parse_config(config_path, args.endpoint_port)
+    extra_dns = [str(ipaddress.ip_address(value)) for value in args.dns]
+    try:
+        profile_dns = [str(ipaddress.ip_address(value)) for value in parsed["dns"]]
+    except ValueError:
+        fail("WireGuard DNS entries must be IP addresses")
+    dns = list(dict.fromkeys(profile_dns + extra_dns))
+    existing = run(["ip", "netns", "list"], check=True).stdout.splitlines()
+    if any(line.split()[0] == args.namespace for line in existing if line.split()):
+        fail("namespace already exists")
+    runtime = Path("/run/windscribe-monitor")
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stripped_path: Path | None = None
+    try:
+        run(["ip", "netns", "add", args.namespace])
+        run(["ip", "link", "add", args.interface, "type", "wireguard"])
+        run(["ip", "link", "set", args.interface, "netns", args.namespace])
+        fd, name = tempfile.mkstemp(prefix=args.namespace + "-", suffix=".conf", dir=runtime)
+        stripped_path = Path(name)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(parsed["stripped"])
+        netns(args.namespace, ["wg", "setconf", args.interface, str(stripped_path)])
+        netns(args.namespace, ["ip", "link", "set", "lo", "up"])
+        for address in parsed["addresses"]:
+            family = "-6" if ":" in address else "-4"
+            netns(args.namespace, ["ip", family, "address", "add", address, "dev", args.interface])
+        netns(args.namespace, ["ip", "link", "set", "mtu", parsed["mtu"], "up", "dev", args.interface])
+        for network in parsed["allowed"]:
+            family = "-6" if ":" in network else "-4"
+            netns(args.namespace, ["ip", family, "route", "replace", network, "dev", args.interface])
+        if dns:
+            resolv_dir = Path("/etc/netns") / args.namespace
+            resolv_dir.mkdir(mode=0o755, parents=True, exist_ok=False)
+            resolv_path = resolv_dir / "resolv.conf"
+            resolv_path.write_text("".join(f"nameserver {server}\n" for server in dns), encoding="ascii")
+            resolv_path.chmod(0o644)
+        print(json.dumps({"ok": True, "addresses": parsed["addresses"], "allowed_ips": parsed["allowed"],
+                          "dns_servers": dns, "mtu": int(parsed["mtu"])}))
+    except BaseException:
+        cleanup(args.namespace, args.interface)
+        raise
+    finally:
+        if stripped_path:
+            stripped_path.unlink(missing_ok=True)
+
+
+def resolve_for_curl(url: str) -> tuple[str, list[str]]:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        fail("only credential-free HTTPS probe URLs are allowed")
+    port = parsed.port or 443
+    infos = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+    if not infos:
+        fail("probe hostname lookup failed")
+    address = next((item[4][0] for item in infos if item[0] == socket.AF_INET), infos[0][4][0])
+    resolve = f"{parsed.hostname}:{port}:{address}"
+    return parsed.hostname, ["--resolve", resolve]
+
+
+def curl(namespace: str, url: str, timeout: int, body: bool = False) -> subprocess.CompletedProcess[str]:
+    _host, resolve = resolve_for_curl(url)
+    command = ["curl", "-4", "--silent", "--show-error", "--location", "--max-time", str(timeout),
+               *resolve, url]
+    if not body:
+        command[1:1] = ["--output", "/dev/null", "--write-out", "%{http_code}\t%{time_total}\t%{size_download}"]
+    return netns(namespace, command, timeout=timeout + 3, check=False)
+
+
+def transfer(namespace: str, interface: str) -> tuple[int, int]:
+    output = netns(namespace, ["wg", "show", interface, "transfer"]).stdout.strip().splitlines()
+    rx = tx = 0
+    for line in output:
+        parts = line.split()
+        if len(parts) >= 3:
+            rx += int(parts[-2])
+            tx += int(parts[-1])
+    return rx, tx
+
+
+def latest_handshake(namespace: str, interface: str) -> int:
+    output = netns(namespace, ["wg", "show", interface, "latest-handshakes"]).stdout.splitlines()
+    values = [int(line.split()[-1]) for line in output if line.split() and line.split()[-1].isdigit()]
+    return max(values, default=0)
+
+
+def probe(args: argparse.Namespace) -> None:
+    validate_names(args.namespace, args.interface)
+    target = str(ipaddress.ip_address(args.ping_target))
+    ping = netns(args.namespace, ["ping", "-c", str(args.ping_count), "-W", "1", target],
+                 timeout=args.timeout + 2, check=False)
+    ping_raw = (ping.stdout + "\n" + ping.stderr).strip()
+    packets = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received, ([\d.]+)% packet loss", ping_raw)
+    stats = re.search(r"(?:round-trip|rtt) min/avg/max/(?:stddev|mdev) = [\d.]+/([\d.]+)/", ping_raw)
+    http = curl(args.namespace, args.connectivity_url, args.timeout)
+    ip_result = curl(args.namespace, args.public_ip_url, args.timeout, body=True)
+    vpn_ip = ip_result.stdout.strip() if ip_result.returncode == 0 else None
+    if vpn_ip:
+        try:
+            ipaddress.ip_address(vpn_ip)
+        except ValueError:
+            vpn_ip = None
+    deadline = time.monotonic() + args.handshake_timeout
+    handshake = latest_handshake(args.namespace, args.interface)
+    while handshake < int(args.started_at) and time.monotonic() < deadline:
+        time.sleep(0.5)
+        handshake = latest_handshake(args.namespace, args.interface)
+    rx, tx = transfer(args.namespace, args.interface)
+    links = netns(args.namespace, ["ip", "-o", "link", "show"]).stdout
+    interface_names = set(re.findall(r"^\d+: ([^:@]+)", links, re.MULTILINE))
+    v4_default = netns(args.namespace, ["ip", "-4", "route", "show", "default"], check=False).stdout.strip()
+    v6_default = netns(args.namespace, ["ip", "-6", "route", "show", "default"], check=False).stdout.strip()
+    resolv = Path("/etc/netns") / args.namespace / "resolv.conf"
+    dns_servers = re.findall(r"^nameserver\s+(\S+)", resolv.read_text() if resolv.exists() else "", re.MULTILINE)
+    dns_route_ok = None
+    dns_resolution_ok = None
+    if dns_servers:
+        route = netns(args.namespace, ["ip", "route", "get", dns_servers[0]], check=False)
+        dns_route_ok = route.returncode == 0 and f"dev {args.interface}" in route.stdout
+        host, _resolve = resolve_for_curl(args.connectivity_url)
+        lookup = netns(args.namespace, ["getent", "ahosts", host], timeout=args.timeout, check=False)
+        dns_resolution_ok = lookup.returncode == 0 and bool(lookup.stdout.strip())
+    http_parts = http.stdout.strip().split("\t")
+    http_code = int(http_parts[0]) if http.returncode == 0 and http_parts and http_parts[0].isdigit() else None
+    elapsed_ms = float(http_parts[1]) * 1000 if len(http_parts) > 1 else None
+    result = {
+        "ok": True,
+        "fresh_handshake": handshake >= int(args.started_at),
+        "latest_handshake": handshake,
+        "rx_bytes": rx,
+        "tx_bytes": tx,
+        "data_transfer_verified": rx > 0 and tx > 0,
+        "vpn_public_ip": vpn_ip,
+        "http": {"ok": http.returncode == 0 and http_code is not None and 200 <= http_code < 500,
+                 "status": http_code, "elapsed_ms": elapsed_ms,
+                 "error": http.stderr.strip() or None},
+        "ping": {"ok": ping.returncode == 0 and bool(packets),
+                 "transmitted": int(packets.group(1)) if packets else None,
+                 "received": int(packets.group(2)) if packets else None,
+                 "packet_loss_percent": float(packets.group(3)) if packets else None,
+                 "latency_avg_ms": float(stats.group(1)) if stats else None,
+                 "raw": ping_raw[-1500:]},
+        "isolation": {"interfaces": sorted(interface_names),
+                      "host_uplink_absent": interface_names <= {"lo", args.interface},
+                      "ipv4_default_via_tunnel": f"dev {args.interface}" in v4_default,
+                      "ipv6_default_via_tunnel": f"dev {args.interface}" in v6_default,
+                      "dns_servers": dns_servers,
+                      "dns_route_via_tunnel": dns_route_ok,
+                      "dns_resolution_ok": dns_resolution_ok},
+    }
+    print(json.dumps(result))
+
+
+def speed(args: argparse.Namespace) -> None:
+    validate_names(args.namespace, args.interface)
+    _host, resolve = resolve_for_curl(args.url)
+    proc = netns(args.namespace, ["curl", "-4", "--silent", "--show-error", "--location",
+                  "--max-time", str(args.timeout), *resolve, "--output", "/dev/null",
+                  "--range", f"0-{args.bytes - 1}",
+                  "--max-filesize", str(args.bytes),
+                  "--write-out", "%{size_download}\t%{time_total}", args.url],
+                 timeout=args.timeout + 3, check=False)
+    parts = proc.stdout.strip().split("\t")
+    downloaded = int(float(parts[0])) if proc.returncode == 0 and parts and parts[0] else 0
+    elapsed = float(parts[1]) if len(parts) > 1 else 0.0
+    mbps = downloaded * 8 / 1_000_000 / elapsed if downloaded and elapsed > 0 else None
+    print(json.dumps({"ok": proc.returncode == 0 and 0 < downloaded <= args.bytes,
+                      "bytes_read": downloaded, "elapsed_seconds": elapsed,
+                      "mbps": mbps, "error": proc.stderr.strip() or None}))
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser()
+    commands = root.add_subparsers(dest="command", required=True)
+    up = commands.add_parser("setup")
+    up.add_argument("--namespace", required=True)
+    up.add_argument("--interface", required=True)
+    up.add_argument("--config", required=True)
+    up.add_argument("--dns", action="append", default=[])
+    up.add_argument("--endpoint-port", type=int, default=0)
+    down = commands.add_parser("cleanup")
+    down.add_argument("--namespace", required=True)
+    check = commands.add_parser("probe")
+    check.add_argument("--namespace", required=True)
+    check.add_argument("--interface", required=True)
+    check.add_argument("--started-at", required=True, type=float)
+    check.add_argument("--handshake-timeout", type=int, default=15)
+    check.add_argument("--ping-target", required=True)
+    check.add_argument("--ping-count", type=int, default=5)
+    check.add_argument("--connectivity-url", required=True)
+    check.add_argument("--public-ip-url", required=True)
+    check.add_argument("--timeout", type=int, default=12)
+    fast = commands.add_parser("speed")
+    fast.add_argument("--namespace", required=True)
+    fast.add_argument("--interface", required=True)
+    fast.add_argument("--url", required=True)
+    fast.add_argument("--bytes", required=True, type=int)
+    fast.add_argument("--timeout", type=int, default=12)
+    return root
+
+
+def main() -> None:
+    args = parser().parse_args()
+    for command in ("ip", "wg"):
+        if not shutil.which(command):
+            fail(f"required command is missing: {command}")
+    if args.command == "setup":
+        setup(args)
+    elif args.command == "cleanup":
+        cleanup(args.namespace)
+    elif args.command == "probe":
+        probe(args)
+    elif args.command == "speed":
+        speed(args)
+
+
+if __name__ == "__main__":
+    main()

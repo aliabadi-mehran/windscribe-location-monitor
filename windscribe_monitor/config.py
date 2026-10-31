@@ -71,7 +71,7 @@ class Config:
     public_ip_url: str = "https://api.ipify.org"
     connectivity_url: str = "https://www.gstatic.com/generate_204"
     shortlist_size: int = 10
-    top_size: int = 3
+    top_size: int = 5
     scheduled_locations: list[str] = field(default_factory=list)
     interval_seconds: int = 10_800
     catchup_after_seconds: int = 11_700
@@ -80,6 +80,17 @@ class Config:
     telegram_token_file: str = ""
     telegram_chat_id: str = ""
     timezone: str = field(default_factory=default_timezone)
+    # Linux/Raspberry Pi uses downloaded, authorized WireGuard profiles inside
+    # isolated network namespaces. macOS continues to use the official client.
+    linux_backend: str = "wireguard-configs"
+    wireguard_config_dir: str = "~/.config/windscribe/wireguard"
+    wireguard_helper: str = "/usr/local/libexec/windscribe-monitor-netns"
+    wireguard_handshake_timeout_seconds: int = 15
+    wireguard_dns_servers: list[str] = field(default_factory=list)
+    # Windscribe WireGuard supports multiple listener ports. This override keeps
+    # the authorized endpoint host/key but uses the port that works on the ISP.
+    # Set to 0 to preserve each profile's original endpoint port.
+    wireguard_endpoint_port_override: int = 80
 
     @classmethod
     def load(cls, home: Path | None = None) -> "Config":
