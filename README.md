@@ -1,19 +1,29 @@
 # Windscribe Location Monitor for macOS and Raspberry Pi
 
-A local, standard-library-only Python monitor for testing Windscribe locations through real VPN tunnels, ranking the working locations, and notifying a private Telegram channel in Persian. macOS uses IKEv2; Linux ARM64 uses a protocol supported by Windscribe's official headless client.
+A local, standard-library-only Python monitor for testing Windscribe locations through real VPN tunnels, ranking the working locations, and notifying a private Telegram channel with an English HTML report. macOS continues to use the official Windscribe client with IKEv2. Raspberry Pi/Linux uses authorized WireGuard configuration files inside isolated network namespaces.
 
 The scheduler is intentionally **not enabled by installation alone**. First import the official location names, configure Telegram, run a limited proof-of-concept, confirm the message, and only then enable `launchd` (macOS) or a user `systemd` timer (Linux).
 
 ## Raspberry Pi 4
 
-Windscribe publishes an official CLI-only Debian/Ubuntu ARM64 package suitable for a 64-bit Raspberry Pi OS. Its official protocol table says IKEv2 is Windows/macOS-only, so the Pi cannot reproduce IKEv2/UDP 500 tests. On Linux the monitor defaults to `wireguard:443`; select another officially supported Linux protocol only after checking it with `windscribe-cli ports <protocol>`.
+Raspberry Pi tests do not call `windscribe-cli connect` and never replace the host default route. Each existing Windscribe WireGuard `.conf` file is brought up in a short-lived network namespace. The WireGuard interface is created in the host namespace and moved before it is configured, so its UDP socket retains host reachability while all test traffic, DNS routes, IPv4/IPv6 routes, and the tunnel default route stay inside the namespace. The host SSH route and any existing host WireGuard interface are left untouched.
+
+The Raspberry Pi installer sets `wireguard_endpoint_port_override` to UDP `80`, while retaining every authorized profile's endpoint host, public key, and private key. Set the value to `0` in the private config to use each profile's original port instead.
 
 See [Raspberry Pi deployment](docs/raspberry-pi.md) for installation, private token storage, proof-of-concept, systemd scheduling, and operations.
+
+Quick Raspberry Pi deployment after authorized profiles are in `~/.config/windscribe/wireguard`:
+
+```sh
+git clone https://github.com/aliabadi-mehran/windscribe-location-monitor.git && cd windscribe-location-monitor && ./scripts/install-raspberry-pi.sh
+```
+
+The installer is interactive, reuses the existing Telegram bot/channel, requires an isolated three-profile proof-of-concept, and then enables a local daily 06:00 `systemd` timer. ChatGPT/Codex is not involved at runtime.
 
 ## Supported environment
 
 - A current supported macOS release with Windscribe's official desktop app and CLI.
-- A 64-bit Debian-compatible Linux ARM64 system with Windscribe's official headless CLI.
+- A 64-bit Debian-compatible Linux ARM64 system with `wireguard-tools`, `iproute2`, `curl`, and authorized Windscribe WireGuard profiles.
 - Python 3.9 or newer.
 - An active Windscribe account; credentials remain entirely inside the official client.
 
@@ -28,12 +38,17 @@ One macOS-specific limitation is important: when the GUI app is running, `windsc
 - Connection, status, ping, HTTP, and speed operations have finite timeouts.
 - A non-blocking file lock prevents overlapping runs.
 - Original macOS DNS/routes are left to the official Windscribe client, which restores them on disconnect.
+- Raspberry Pi namespaces contain only loopback and the temporary WireGuard interface. Cleanup deletes the namespace and its private resolver file; no host default route, DNS file, or existing interface is modified.
 - The monitor does not toggle the Windscribe firewall, network rules, split tunneling, macOS security settings, or Wi-Fi.
 - Speed tests run only on the best ten functional locations and read at most 5 MB each by default.
 - Telegram tokens are read from macOS Keychain or a mode-`600` Linux secret file outside the repository; they are never stored in source files, logs, or Git.
 - Undeliverable Telegram messages are queued as private local files and retried after later successful runs.
 
 ## Location inventory
+
+On Raspberry Pi, the inventory is exactly the set of mode-`600` `.conf` files below `wireguard_config_dir` (default `~/.config/windscribe/wireguard`). Subdirectories are supported and relative filenames become report labels. The program neither downloads profiles through an undocumented API nor derives missing endpoints or credentials. Run `wireguard-discover` to review the available authorized configurations. If a location is absent, generate/download its individual WireGuard profile through Windscribe's supported account/configuration workflow and add it privately on the Pi.
+
+The macOS inventory workflow remains unchanged:
 
 Preferred supported workflow:
 
@@ -90,7 +105,7 @@ Run the doctor first:
 ./bin/windscribe-monitor doctor
 ```
 
-The first live run deliberately tests only three imported locations:
+The first live run deliberately tests only three imported macOS locations or three discovered Raspberry Pi WireGuard profiles:
 
 ```sh
 ./bin/windscribe-monitor run --limit 3
@@ -102,7 +117,7 @@ To test specific imported nicknames without changing the inventory:
 ./bin/windscribe-monitor run --locations Lygos Ghvino Khalifa
 ```
 
-This command changes VPN connections and should be run only after confirming that no intentional VPN session is active. The program itself performs the same check and aborts if it finds one.
+On macOS this command changes the app-managed VPN connection and therefore refuses to run over an existing tunnel. On Raspberry Pi it creates only isolated namespaces and does not disconnect or reconfigure an existing host tunnel. The limited proof-of-concept must still be reviewed before a full sweep.
 
 After reviewing the JSON evidence under `~/Library/Application Support/WindscribeMonitor/runs/` and confirming the Telegram message, run the full sweep manually:
 
@@ -126,14 +141,14 @@ When `scheduled_locations` is empty in the private `config.json`, scheduled runs
 
 `launchd` timers do not guarantee execution at the exact missed time while the Mac sleeps. On wake/login, the agent runs and the due-time guard provides a safe catch-up. A guaranteed wake would require an explicit power-management schedule and should not be installed silently.
 
-On Raspberry Pi/Linux, enable the equivalent persistent user timer after the proof-of-concept:
+On Raspberry Pi/Linux, install the reviewed root-owned namespace helper and enable the persistent user timer only after the proof-of-concept:
 
 ```sh
 sudo loginctl enable-linger "$USER"
 ./bin/windscribe-monitor install-systemd
 ```
 
-The timer uses the same 03:00, 09:00, 15:00, and 21:00 schedule in the server's local timezone. `Persistent=true` catches up after a reboot or outage.
+The Raspberry Pi timer is a local `systemd` timer and has no ChatGPT/Codex dependency. It runs once per day at 06:00 in the server's local timezone. `Persistent=true` catches up after a reboot or outage. A file lock prevents overlap; an interrupted full sweep keeps a private checkpoint and the next scheduled run resumes it.
 
 ## Operations
 
@@ -150,7 +165,7 @@ The timer uses the same 03:00, 09:00, 15:00, and 21:00 schedule in the server's 
 # Retry queued Telegram messages
 ./bin/windscribe-monitor flush-queue
 
-# Retry queued Telegram messages through a known working location
+# macOS only: retry queued Telegram messages through a known working app location
 ./bin/windscribe-monitor flush-via-vpn --location Motlawa
 
 # Disable scheduled execution, preserving data/configuration
@@ -162,7 +177,7 @@ The timer uses the same 03:00, 09:00, 15:00, and 21:00 schedule in the server's 
 
 ## Ranking
 
-Only endpoints with a settled CLI-confirmed tunnel using the configured protocol, a working HTTP request, and (when available) a changed public IP are considered functional. Candidates are ordered by historical connection reliability, then packet loss, latency, and capped download throughput. The best ten receive speed tests; the best three are reported.
+On Raspberry Pi, a location is functional only after a fresh `wg` handshake timestamp, non-zero bidirectional WireGuard transfer counters, HTTPS connectivity, a tunnel public IP distinct from the host baseline when available, and verified namespace route isolation. Candidates are ordered by historical connection reliability, then packet loss, latency, and capped download throughput. All profiles receive connectivity tests; only the best ten receive speed tests, and the best five are reported.
 
 Measurements are deliberately described precisely:
 
@@ -172,7 +187,7 @@ Measurements are deliberately described precisely:
 
 ## Portability
 
-The measurement, ranking, state, and Telegram modules are shared across macOS and Linux. The scheduler and secret storage select the supported platform implementation. `locations.txt`, private configuration, history, queue, run records, and report logic remain portable.
+The ranking, state, Telegram, and report formats remain shared. macOS keeps the existing official-client backend; Linux selects the isolated WireGuard-profile backend. Telegram credentials, WireGuard profiles, history, queue, and run records remain outside Git.
 
 See [Troubleshooting](docs/troubleshooting.md) for failure handling and recovery details.
 

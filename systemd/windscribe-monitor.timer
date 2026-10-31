@@ -1,8 +1,8 @@
 [Unit]
-Description=Run Windscribe location monitoring every six hours
+Description=Run isolated Windscribe WireGuard monitoring daily at 06:00
 
 [Timer]
-OnCalendar=*-*-* 03,09,15,21:00:00
+OnCalendar=*-*-* 06:00:00
 Persistent=true
 AccuracySec=1min
 Unit=windscribe-monitor.service

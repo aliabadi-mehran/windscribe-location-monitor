@@ -55,17 +55,21 @@ class Telegram:
             raise RuntimeError(f"Telegram {method} failed: {payload.get('description', 'unknown error')}")
         return payload
 
-    def send(self, text: str) -> None:
+    def send(self, text: str, parse_mode: str | None = None) -> None:
         if not self.config.telegram_chat_id:
             raise RuntimeError("Telegram channel id is not configured")
-        self.call("sendMessage", {"chat_id": self.config.telegram_chat_id, "text": text})
+        values = {"chat_id": self.config.telegram_chat_id, "text": text}
+        if parse_mode:
+            values["parse_mode"] = parse_mode
+        self.call("sendMessage", values)
 
 
-def queue_message(home: Path, text: str) -> Path:
+def queue_message(home: Path, text: str, parse_mode: str | None = None) -> Path:
     queue = home / "queue"
     queue.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = queue / f"{int(time.time() * 1000)}.json"
-    path.write_text(json.dumps({"text": text}, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(json.dumps({"text": text, "parse_mode": parse_mode}, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
     path.chmod(0o600)
     return path
 
@@ -76,7 +80,7 @@ def flush_queue(home: Path, telegram: Telegram) -> tuple[int, int]:
     for path in sorted((home / "queue").glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            telegram.send(payload["text"])
+            telegram.send(payload["text"], payload.get("parse_mode"))
             path.unlink()
             sent += 1
         except Exception:

@@ -7,7 +7,9 @@ Wants=network-online.target
 Type=oneshot
 Environment=PYTHONPATH=__PROJECT__
 ExecStart=__PYTHON__ -m windscribe_monitor.cli --home __HOME__ run-scheduled
-TimeoutStartSec=5h45min
+TimeoutStartSec=12h
+TimeoutStopSec=30s
+KillMode=control-group
 Nice=10
 IOSchedulingClass=idle
 

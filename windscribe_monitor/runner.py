@@ -285,6 +285,7 @@ class Monitor:
         for item in ranked[:self.config.top_size]:
             top.append({
                 "location": item["location"],
+                "display_name": item["location"],
                 "reliability_percent": item.get("reliability_percent"),
                 "latency_avg_ms": item.get("ping", {}).get("latency_avg_ms"),
                 "packet_loss_percent": item.get("ping", {}).get("packet_loss_percent"),
@@ -307,10 +308,10 @@ class Monitor:
             telegram = Telegram(self.config)
             try:
                 flush_queue(self.home, telegram)
-                telegram.send(message)
+                telegram.send(message, "HTML")
             except Exception as exc:
                 LOG.error("Telegram delivery failed; queued locally: %s", exc)
-                queue_message(self.home, message)
+                queue_message(self.home, message, "HTML")
                 if top:
                     try:
                         sent, failed = self.flush_telegram_via_location(top[0]["location"])
